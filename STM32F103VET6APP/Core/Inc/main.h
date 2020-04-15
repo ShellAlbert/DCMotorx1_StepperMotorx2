@@ -70,6 +70,10 @@ void Error_Handler(void);
 #define SM_UpDown_NSLEEP_GPIO_Port GPIOD
 #define SM_UpDown_DIR_Pin GPIO_PIN_14
 #define SM_UpDown_DIR_GPIO_Port GPIOD
+#define M62429_DAT_Pin GPIO_PIN_6
+#define M62429_DAT_GPIO_Port GPIOD
+#define M62429_CLK_Pin GPIO_PIN_7
+#define M62429_CLK_GPIO_Port GPIOD
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
