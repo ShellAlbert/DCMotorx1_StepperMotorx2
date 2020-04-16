@@ -35,6 +35,7 @@
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+typedef StaticQueue_t osStaticMessageQDef_t;
 /* USER CODE BEGIN PTD */
 
 /* USER CODE END PTD */
@@ -95,6 +96,17 @@ const osThreadAttr_t ZModBusTask_attributes = {
 		.priority = (osPriority_t) osPriorityNormal,
 		.stack_size = 512
 };
+/* Definitions for encoderQueue */
+osMessageQueueId_t encoderQueueHandle;
+uint8_t encoderQueueBuffer[ 6 * sizeof( uint32_t ) ];
+osStaticMessageQDef_t encoderQueueControlBlock;
+const osMessageQueueAttr_t encoderQueue_attributes = {
+		.name = "encoderQueue",
+		.cb_mem = &encoderQueueControlBlock,
+		.cb_size = sizeof(encoderQueueControlBlock),
+		.mq_mem = &encoderQueueBuffer,
+		.mq_size = sizeof(encoderQueueBuffer)
+};
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -128,6 +140,8 @@ uint32_t g_CRC32JAMCRCCalculate(uint8_t *s, int len);
 
 //the flag.
 uint8_t g_flagDCMotorPeakCurrent = 0;
+#define ENCODER_RANGE_MIN	500
+#define ENCODER_RANGE_MAX	6000
 
 //each command is 24 bytes at least.
 //Sync(4)+Length(4)+Key(4)+Address(4)+Data(4)+Padding(0)+CRC32(4)
@@ -200,8 +214,8 @@ typedef struct {
 	uint32_t newAddr;
 	uint32_t curAddr;
 } ZModBusObject;
-
 ZModBusObject modbusObj;
+
 enum {
 	nReg_Battery_R = 0x000001,						//read battery register.
 	nReg_RSSI_R = 0x000002, 						//read RSSI register.
@@ -228,18 +242,18 @@ enum {
 uint16_t g_ADC1DMABuffer[30][2];
 
 //根据数据手册得知STM32F103VET6是大容量产品
-//具有512K Internal Flash�?64K SRAM
+//具有512K Internal Flash�??64K SRAM
 //Page 0: 0x0800 0000 ~ 0x0800 07FF,2Kbytes
 //Page 1: 0x0800 0800 ~ 0x0800 0FFF,2Kbytes
 //Page 2: 0x0800 1000 ~ 0x0800 17FF,2Kbytes
 //Page 3: 0x0800 1800 ~ 0x0800 1FFF,2Kbytes
 // ...............
 //Page255:0x0807 F800 ~ 0x0807 FFFF,2Kbytes
-//�?以说从Page0�?始存放的是程序代码，总共容量�?2K*256=512Kbytes
-//如果程序只占用了�?部分，那么剩下的�?部分可以用于存放数据.
-//这里将数据首地址定义�?0x0801E000
-//因此�?(0x0801E000-0x08000000)=122880bytes=120K
-//这就相当于给程序留出了前120K的空间，余下的空间用于数据存�?
+//�??以说从Page0�??始存放的是程序代码，总共容量�??2K*256=512Kbytes
+//如果程序只占用了�??部分，那么剩下的�??部分可以用于存放数据.
+//这里将数据首地址定义�??0x0801E000
+//因此�??(0x0801E000-0x08000000)=122880bytes=120K
+//这就相当于给程序留出了前120K的空间，余下的空间用于数据存�??
 #include "stm32f1xx_hal_flash_ex.h"
 #define ZSY_DATA_ADDR_BASE 		0x0801E000
 #define PAGE_SIZE               (uint32_t)FLASH_PAGE_SIZE  /* Page size */
@@ -387,11 +401,20 @@ void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef *hadc) {
 				//here we do not set to 0,because it reaches the boundary.
 				//0-1=65535 or 65535+1=0.
 				//so here we use 500 as the ZeroPoint encoder value.
-				__HAL_TIM_SET_COUNTER(&htim5, 500);
+				__HAL_TIM_SET_COUNTER(&htim5, ENCODER_RANGE_MIN);
 
 				//reset flag.
 				g_flagDCMotorPeakCurrent = 1;
 			}
+#if 0
+			//电机启动电流大，指令单步触发时，一启动就进入IRQ这里，然后被强制停止了.
+			//所以这里的机制需要改一下。
+			if(g_flagDCMotorPeakCurrent){
+				//run progress peak current happened.
+				//stop PWM output to protect DC motor.
+				__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 180);
+			}
+#endif
 		}
 	}
 }
@@ -452,7 +475,7 @@ void zsy_Delay()
 		;
 	}
 }
-void zsyParseModBusFrame(ZModBusObject *obj) {
+void zsyParseModBusFrame(ZModBusObject *obj,osMessageQueueId_t queue) {
 	if (obj->m_flagEncrypt) {
 		//do not support encrypted frame in this version.
 		return;
@@ -527,17 +550,24 @@ void zsyParseModBusFrame(ZModBusObject *obj) {
 	case nReg_LenMotorCtl_W: {
 		uint8_t uWhichMotor = (obj->m_data >> 24) & 0xFF;
 		uint8_t uMotorAction = (obj->m_data >> 16) & 0xFF;
-		uint16_t uMotorIncrease = 1800;
+		//调节这个值，单次的前进量
+		uint16_t uMotorIncrease = 100;
 		switch (uWhichMotor) {
 		case 0x1:				//left motor.
 			if (uMotorAction == 0x1)				//clockwise.
 			{
 				//44 45 43 54 00 00 00 10 00 00 00 00 01 80 00 04 01 01 00 01 5A EB EF 5A
-				(obj->m_uTargetEncoder) += uMotorIncrease;
+				if((obj->m_uTargetEncoder+uMotorIncrease)<ENCODER_RANGE_MAX)
+				{
+					(obj->m_uTargetEncoder) += uMotorIncrease;
+				}
 			} else if (uMotorAction == 0x2)				//anti-clockwise.
 			{
 				//44 45 43 54 00 00 00 10 00 00 00 00 01 80 00 04 01 02 00 01 58 AD 51 01
-				(obj->m_uTargetEncoder) -= uMotorIncrease;
+				if((obj->m_uTargetEncoder-uMotorIncrease)>ENCODER_RANGE_MIN)
+				{
+					(obj->m_uTargetEncoder) -= uMotorIncrease;
+				}
 			}
 			break;
 		case 0x2:				//right motor.
@@ -549,12 +579,14 @@ void zsyParseModBusFrame(ZModBusObject *obj) {
 		}
 		//CAUTION!!! here to prevent encoder value to overflow.
 		//0-1=65535    65535+1=0
-		if (obj->m_uTargetEncoder < 180) {
-			obj->m_uTargetEncoder = 180;
-		} else if (obj->m_uTargetEncoder >= 65535) {
-			obj->m_uTargetEncoder = 65535;
+		if (obj->m_uTargetEncoder < ENCODER_RANGE_MIN) {
+			obj->m_uTargetEncoder = ENCODER_RANGE_MIN;
+		} else if (obj->m_uTargetEncoder >= ENCODER_RANGE_MAX) {
+			obj->m_uTargetEncoder = ENCODER_RANGE_MAX;
 		}
 		zsyTxResponse(nReg_LenMotorCtl_W, obj->m_data);
+
+		osMessageQueuePut(encoderQueueHandle,&obj->m_uTargetEncoder,0,100);
 	}
 	break;
 	case nReg_2DBracketCtl_W: {
@@ -887,6 +919,10 @@ int main(void)
 	/* USER CODE BEGIN RTOS_TIMERS */
 	/* start timers, add new ones, ... */
 	/* USER CODE END RTOS_TIMERS */
+
+	/* Create the queue(s) */
+	/* creation of encoderQueue */
+	encoderQueueHandle = osMessageQueueNew (6, sizeof(uint32_t), &encoderQueue_attributes);
 
 	/* USER CODE BEGIN RTOS_QUEUES */
 	/* add queues, ... */
@@ -1625,10 +1661,41 @@ void ZPidTaskLoop(void *argument)
 {
 	/* USER CODE BEGIN ZPidTaskLoop */
 	/* Infinite loop */
-
-	ZModBusObject *obj = (ZModBusObject*) argument;
-
+	uint32_t uShadow1,uShadow2,uShadow3;
+	uint32_t uTargetEncoder=500;//the initial value when reaches ZeroPoint.
 	for (;;) {
+		uint32_t uNewTargetEncoder;
+		if(osOK==osMessageQueueGet(encoderQueueHandle,&uNewTargetEncoder,NULL,10))
+		{
+			uTargetEncoder=uNewTargetEncoder;
+		}
+		if (g_flagDCMotorPeakCurrent) {
+			float fPIDOut;
+			uint32_t uCurrentEncoder;
+			uint32_t uPWMCtl = 0;
+
+			uCurrentEncoder = __HAL_TIM_GET_COUNTER(&htim5);
+			fPIDOut = zsy_PIDCalculate(&modbusObj, uTargetEncoder,uCurrentEncoder);
+			if (fPIDOut > 180) {
+				fPIDOut = 180;
+			} else if (fPIDOut < -180) {
+				fPIDOut = -180;
+			}
+
+			uPWMCtl = 180 - fPIDOut;
+			__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, uPWMCtl);
+
+			//if(uShadow1!=uCurrentEncoder || uShadow2!=uTargetEncoder || uShadow3!=uPWMCtl)
+			{
+				char buffer[32];
+				sprintf(buffer,"<%u,%u,%u> \n\r\0",uCurrentEncoder,uTargetEncoder,uPWMCtl);
+				HAL_UART_Transmit(&huart1,buffer,strlen(buffer),100);
+
+				uShadow1=uCurrentEncoder;
+				uShadow2=uTargetEncoder;
+				uShadow3=uPWMCtl;
+			}
+		}
 #if 0
 		//do PID after reached ZeroPoint.
 		if (g_flagDCMotorPeakCurrent) {
@@ -1651,7 +1718,7 @@ void ZPidTaskLoop(void *argument)
 			//   1.if diff=-1,then 180-pidOut=180-(-1)=181,duty cycle=181/360=50.27%
 			//   2.if diff=-10,then 180-pidOut=180-(-10)=190,duty cycle=190/360=52.77%
 			//   3.if diff=-160,then 180-pidOut=180-(-160)=340,duty cycle=340/360=94.44%
-			//   4.if diff=-180�??,then 180-pidOut=180-(-180)=360,duty cycle=360/360=100% (anti-clockwise maximum speed)
+			//   4.if diff=-180�???,then 180-pidOut=180-(-180)=360,duty cycle=360/360=100% (anti-clockwise maximum speed)
 			uCurrentEncoder = __HAL_TIM_GET_COUNTER(&htim5);
 			fPIDOut = zsy_PIDCalculate(obj, obj->m_uTargetEncoder,
 					uCurrentEncoder);
@@ -1681,6 +1748,7 @@ void ZModBusTaskLoop(void *argument)
 {
 	/* USER CODE BEGIN ZModBusTaskLoop */
 	/* Infinite loop */
+	osMessageQueueId_t queue=(osMessageQueueId_t)argument;
 	for (;;) {
 		//do parse out UART1 ModBus protocol.
 		if (g_FlagUart1GetNewData) {
@@ -1691,7 +1759,7 @@ void ZModBusTaskLoop(void *argument)
 				uint32_t t2 = g_Uart1DmaPoll[i + 2];
 				uint32_t t3 = g_Uart1DmaPoll[i + 3];
 				uint32_t uRxData = (t0 << 24) | (t1 << 16) | (t2 << 8)
-																				| (t3 << 0);
+																														| (t3 << 0);
 				switch (modbusObj.m_fsm) {
 				case UnPack_Sync_Filed:
 					if (uRxData == 0x44454354) {
@@ -1750,7 +1818,9 @@ void ZModBusTaskLoop(void *argument)
 							modbusObj.m_crc32Buffer,
 							modbusObj.m_crc32BufferLen);
 					if (modbusObj.m_crc32 == uCalcCRC32) {
-						zsyParseModBusFrame(&modbusObj);
+						zsyParseModBusFrame(&modbusObj,queue);
+					}else{
+						//CRC32 is error.
 					}
 					break;
 				default:
