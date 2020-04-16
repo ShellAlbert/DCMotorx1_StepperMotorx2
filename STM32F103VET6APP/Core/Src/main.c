@@ -140,8 +140,13 @@ uint32_t g_CRC32JAMCRCCalculate(uint8_t *s, int len);
 
 //the flag.
 uint8_t g_flagDCMotorPeakCurrent = 0;
+
+//we define the minimum and maximum encoder value
+//to avoid up/down overflow.
+//the encoder register in stm32 is 16bit,so it's range is 0~65535.
 #define ENCODER_RANGE_MIN	500
-#define ENCODER_RANGE_MAX	6000
+#define ENCODER_RANGE_MAX	6500
+#define ENCODER_MOVE_STEP	100
 
 //each command is 24 bytes at least.
 //Sync(4)+Length(4)+Key(4)+Address(4)+Data(4)+Padding(0)+CRC32(4)
@@ -241,19 +246,17 @@ enum {
 //ADC1-Channel12: 	RSSI
 uint16_t g_ADC1DMABuffer[30][2];
 
-//根据数据手册得知STM32F103VET6是大容量产品
-//具有512K Internal Flash�??64K SRAM
+//according to the data sheet,STM32F103VET6 has 512KB Flash and 64KB SDRAM
 //Page 0: 0x0800 0000 ~ 0x0800 07FF,2Kbytes
 //Page 1: 0x0800 0800 ~ 0x0800 0FFF,2Kbytes
 //Page 2: 0x0800 1000 ~ 0x0800 17FF,2Kbytes
 //Page 3: 0x0800 1800 ~ 0x0800 1FFF,2Kbytes
 // ...............
 //Page255:0x0807 F800 ~ 0x0807 FFFF,2Kbytes
-//�??以说从Page0�??始存放的是程序代码，总共容量�??2K*256=512Kbytes
-//如果程序只占用了�??部分，那么剩下的�??部分可以用于存放数据.
-//这里将数据首地址定义�??0x0801E000
-//因此�??(0x0801E000-0x08000000)=122880bytes=120K
-//这就相当于给程序留出了前120K的空间，余下的空间用于数据存�??
+//so here we used the front section to save program,use the rear section to save data.
+//(0x0801E000-0x08000000)=122880bytes=120K
+//so we use front 120KB to save program.
+//the rest space (512KB-120KB=392KB) to save data.
 #include "stm32f1xx_hal_flash_ex.h"
 #define ZSY_DATA_ADDR_BASE 		0x0801E000
 #define PAGE_SIZE               (uint32_t)FLASH_PAGE_SIZE  /* Page size */
@@ -397,10 +400,9 @@ void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef *hadc) {
 				//CCR/ARR=180/360=50%.
 				__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 180);
 
-				//reset encoder to 0.
-				//here we do not set to 0,because it reaches the boundary.
-				//0-1=65535 or 65535+1=0.
-				//so here we use 500 as the ZeroPoint encoder value.
+				//reset encoder value.
+				//here we do not set to 0 to avoid it reaches the boundary easily.
+				//so here we use ENCODER_RANGE_MIN as the ZeroPoint encoder value.
 				__HAL_TIM_SET_COUNTER(&htim5, ENCODER_RANGE_MIN);
 
 				//reset flag.
@@ -550,8 +552,8 @@ void zsyParseModBusFrame(ZModBusObject *obj,osMessageQueueId_t queue) {
 	case nReg_LenMotorCtl_W: {
 		uint8_t uWhichMotor = (obj->m_data >> 24) & 0xFF;
 		uint8_t uMotorAction = (obj->m_data >> 16) & 0xFF;
-		//调节这个值，单次的前进量
-		uint16_t uMotorIncrease = 100;
+		//change this value to adjust the single step.
+		uint16_t uMotorIncrease = ENCODER_MOVE_STEP;
 		switch (uWhichMotor) {
 		case 0x1:				//left motor.
 			if (uMotorAction == 0x1)				//clockwise.
@@ -796,9 +798,9 @@ void zsyParseModBusFrame(ZModBusObject *obj,osMessageQueueId_t queue) {
 		//CrossXY register was changed,we should remember it.
 		zsy_FlushToFlash();
 
-		//soft-reset for debug.
-		__set_FAULTMASK(1);
-		NVIC_SystemReset();
+//		//soft-reset for debug.
+//		__set_FAULTMASK(1);
+//		NVIC_SystemReset();
 		break;
 	case nReg_AutoFocus1_R:
 		zsyTxResponse(nReg_AutoFocus1_R, obj->m_data);
@@ -897,12 +899,6 @@ int main(void)
 	modbusObj.m_uBatteryPercent = 0;
 	modbusObj.m_uRSSIPercent = 0;
 	modbusObj.m_uDistance = 0;
-
-	//if this initial value is 0,it may cause error.
-	//here we do not set to 0,because it reaches the boundary.
-	//0-1=65535 or 65535+1=0.
-	//so here we use 500 as the ZeroPoint encoder value.
-	modbusObj.m_uTargetEncoder = 500;
 
 	/* USER CODE END 2 */
 	/* Init scheduler */
