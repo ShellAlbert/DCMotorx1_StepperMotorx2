@@ -28,6 +28,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stm32f1xx_hal_uart.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define _ZSY_DEBUG_LOG 1
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -75,14 +79,14 @@ osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
 		.name = "defaultTask",
 		.priority = (osPriority_t) osPriorityNormal,
-		.stack_size = 128
+		.stack_size = 512
 };
 /* Definitions for ZPidTask */
 osThreadId_t ZPidTaskHandle;
 const osThreadAttr_t ZPidTask_attributes = {
 		.name = "ZPidTask",
 		.priority = (osPriority_t) osPriorityRealtime,
-		.stack_size = 256
+		.stack_size = 512
 };
 /* Definitions for ZModBusTask */
 osThreadId_t ZModBusTaskHandle;
@@ -224,18 +228,18 @@ enum {
 uint16_t g_ADC1DMABuffer[30][2];
 
 //根据数据手册得知STM32F103VET6是大容量产品
-//具有512K Internal Flash和64K SRAM
+//具有512K Internal Flash�?64K SRAM
 //Page 0: 0x0800 0000 ~ 0x0800 07FF,2Kbytes
 //Page 1: 0x0800 0800 ~ 0x0800 0FFF,2Kbytes
 //Page 2: 0x0800 1000 ~ 0x0800 17FF,2Kbytes
 //Page 3: 0x0800 1800 ~ 0x0800 1FFF,2Kbytes
 // ...............
 //Page255:0x0807 F800 ~ 0x0807 FFFF,2Kbytes
-//所以说从Page0开始存放的是程序代码，总共容量是2K*256=512Kbytes
-//如果程序只占用了一部分，那么剩下的一部分可以用于存放数据.
-//这里将数据首地址定义为0x0801E000
-//因此有(0x0801E000-0x08000000)=122880bytes=120K
-//这就相当于给程序留出了前120K的空间，余下的空间用于数据存储
+//�?以说从Page0�?始存放的是程序代码，总共容量�?2K*256=512Kbytes
+//如果程序只占用了�?部分，那么剩下的�?部分可以用于存放数据.
+//这里将数据首地址定义�?0x0801E000
+//因此�?(0x0801E000-0x08000000)=122880bytes=120K
+//这就相当于给程序留出了前120K的空间，余下的空间用于数据存�?
 #include "stm32f1xx_hal_flash_ex.h"
 #define ZSY_DATA_ADDR_BASE 		0x0801E000
 #define PAGE_SIZE               (uint32_t)FLASH_PAGE_SIZE  /* Page size */
@@ -262,6 +266,14 @@ void zsy_FindUnusedBlk(void)
 	while(modbusObj.curAddr<(ZSY_DATA_ADDR_BASE+PAGE_SIZE))
 	{
 		uint32_t u32RdData = RD_WORD(modbusObj.curAddr);
+		//other data ?  erase page.
+		if(u32RdData != 0x19870901 && u32RdData != 0xFFFFFFFF)
+		{
+			zsy_ErasePage();
+			modbusObj.curAddr = ZSY_DATA_ADDR_BASE;
+			modbusObj.newAddr = ZSY_DATA_ADDR_BASE;
+			return;
+		}
 		//if the first word is 0xFFFFFFFF,it means this is not used yet.
 		if(u32RdData == 0xFFFFFFFF)
 		{
@@ -339,12 +351,17 @@ void zsy_LoadFromFlash(void)
 				modbusObj.m_uFPGAReg=1;
 				modbusObj.m_uCrossXY=0;
 			}
+#ifdef _ZSY_DEBUG_LOG
+			char buffer[128];
 			//output the default value.
-//			uint8_t buffer[128];
-//			sprintf("Log:%d,%d,%d,%d\n",///<
-//					modbusObj.m_uOutputVol,modbusObj.m_uVideoCtl,///<
-//					modbusObj.m_uFPGAReg,modbusObj.m_uCrossXY);
-//			HAL_UART_Transmit(&huart1, buffer, strlen(buffer), 1000);
+			sprintf(buffer,"Para:%x,%x,%x,(%x,%x)\n",///<
+					modbusObj.m_uOutputVol,///<
+					modbusObj.m_uVideoCtl,///<
+					modbusObj.m_uFPGAReg,///<
+					(modbusObj.m_uCrossXY>>16)&0xFFFF,///<
+					(modbusObj.m_uCrossXY>>0)&0xFFFF);
+			HAL_UART_Transmit(&huart1, buffer, strlen(buffer), 1000);
+#endif
 			return;
 		}
 	}
@@ -746,6 +763,10 @@ void zsyParseModBusFrame(ZModBusObject *obj) {
 
 		//CrossXY register was changed,we should remember it.
 		zsy_FlushToFlash();
+
+		//soft-reset for debug.
+		__set_FAULTMASK(1);
+		NVIC_SystemReset();
 		break;
 	case nReg_AutoFocus1_R:
 		zsyTxResponse(nReg_AutoFocus1_R, obj->m_data);
@@ -1630,7 +1651,7 @@ void ZPidTaskLoop(void *argument)
 			//   1.if diff=-1,then 180-pidOut=180-(-1)=181,duty cycle=181/360=50.27%
 			//   2.if diff=-10,then 180-pidOut=180-(-10)=190,duty cycle=190/360=52.77%
 			//   3.if diff=-160,then 180-pidOut=180-(-160)=340,duty cycle=340/360=94.44%
-			//   4.if diff=-180�?,then 180-pidOut=180-(-180)=360,duty cycle=360/360=100% (anti-clockwise maximum speed)
+			//   4.if diff=-180�??,then 180-pidOut=180-(-180)=360,duty cycle=360/360=100% (anti-clockwise maximum speed)
 			uCurrentEncoder = __HAL_TIM_GET_COUNTER(&htim5);
 			fPIDOut = zsy_PIDCalculate(obj, obj->m_uTargetEncoder,
 					uCurrentEncoder);
@@ -1670,7 +1691,7 @@ void ZModBusTaskLoop(void *argument)
 				uint32_t t2 = g_Uart1DmaPoll[i + 2];
 				uint32_t t3 = g_Uart1DmaPoll[i + 3];
 				uint32_t uRxData = (t0 << 24) | (t1 << 16) | (t2 << 8)
-																		| (t3 << 0);
+																				| (t3 << 0);
 				switch (modbusObj.m_fsm) {
 				case UnPack_Sync_Filed:
 					if (uRxData == 0x44454354) {
