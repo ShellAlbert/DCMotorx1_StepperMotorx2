@@ -184,6 +184,17 @@ typedef struct {
 	uint32_t m_uVideoCtl;
 	uint32_t m_uFPGAReg;
 	uint32_t m_uCrossXY;
+
+	//for Flash Read & Write.
+	//each block data structure is
+	//Sync Prefix:(uint32_t)
+	//m_uOutputVol:(uint32_t)
+	//m_uVideoCtl:(uint32_t)
+	//m_uFPGAReg:(uint32_t)
+	//m_uCrossXY:(uint32_t)
+	//so the total bytes is 5*(uint32_t)=20 bytes.
+	uint32_t newAddr;
+	uint32_t curAddr;
 } ZModBusObject;
 
 ZModBusObject modbusObj;
@@ -212,6 +223,132 @@ enum {
 //ADC1-Channel12: 	RSSI
 uint16_t g_ADC1DMABuffer[30][2];
 
+//根据数据手册得知STM32F103VET6是大容量产品
+//具有512K Internal Flash和64K SRAM
+//Page 0: 0x0800 0000 ~ 0x0800 07FF,2Kbytes
+//Page 1: 0x0800 0800 ~ 0x0800 0FFF,2Kbytes
+//Page 2: 0x0800 1000 ~ 0x0800 17FF,2Kbytes
+//Page 3: 0x0800 1800 ~ 0x0800 1FFF,2Kbytes
+// ...............
+//Page255:0x0807 F800 ~ 0x0807 FFFF,2Kbytes
+//所以说从Page0开始存放的是程序代码，总共容量是2K*256=512Kbytes
+//如果程序只占用了一部分，那么剩下的一部分可以用于存放数据.
+//这里将数据首地址定义为0x0801E000
+//因此有(0x0801E000-0x08000000)=122880bytes=120K
+//这就相当于给程序留出了前120K的空间，余下的空间用于数据存储
+#include "stm32f1xx_hal_flash_ex.h"
+#define ZSY_DATA_ADDR_BASE 		0x0801E000
+#define PAGE_SIZE               (uint32_t)FLASH_PAGE_SIZE  /* Page size */
+#define RD_HALF_WORD(addr)		(*(uint16_t*)(addr))
+#define RD_WORD(addr)			(*(uint16_t*)(addr)) | (*(uint16_t*)((addr)+2)<<16)
+void zsy_ErasePage(void)
+{
+	/* -1- Unlock the Flash Bank Program Erase controller */
+	HAL_FLASH_Unlock();
+
+	/* -2- Clear All pending flags */
+	__HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_WRPERR | FLASH_FLAG_PGERR);
+
+	/* -3- erase the FLASH pages */
+	FLASH_PageErase(ZSY_DATA_ADDR_BASE);
+	FLASH_WaitForLastOperation(FLASH_TIMEOUT_VALUE);
+	CLEAR_BIT(FLASH->CR, FLASH_CR_PER);
+
+	/* -5- Lock the Flash Bank Program Erase controller */
+	HAL_FLASH_Lock();
+}
+void zsy_FindUnusedBlk(void)
+{
+	while(modbusObj.curAddr<(ZSY_DATA_ADDR_BASE+PAGE_SIZE))
+	{
+		uint32_t u32RdData = RD_WORD(modbusObj.curAddr);
+		//if the first word is 0xFFFFFFFF,it means this is not used yet.
+		if(u32RdData == 0xFFFFFFFF)
+		{
+			modbusObj.newAddr = modbusObj.curAddr;
+			return;
+		}
+		modbusObj.curAddr += 20;
+	}
+
+	//if the current address reached the boundary, it means all page was used.
+	//so erase all page,and write from the begin address again.
+	if(modbusObj.curAddr >= (ZSY_DATA_ADDR_BASE+PAGE_SIZE))
+	{
+		zsy_ErasePage();
+		modbusObj.curAddr = ZSY_DATA_ADDR_BASE;
+		modbusObj.newAddr = ZSY_DATA_ADDR_BASE;
+	}
+}
+void zsy_FlushToFlash()
+{
+	//first,find a unused block.
+	zsy_FindUnusedBlk();
+
+	//unlock,write,lock.
+	HAL_FLASH_Unlock();
+	HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,modbusObj.newAddr+0,0x19870901);
+	HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,modbusObj.newAddr+4,modbusObj.m_uOutputVol);
+	HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,modbusObj.newAddr+8,modbusObj.m_uVideoCtl);
+	HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,modbusObj.newAddr+12,modbusObj.m_uFPGAReg);
+	HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,modbusObj.newAddr+16,modbusObj.m_uCrossXY);
+	HAL_FLASH_Lock();
+}
+//to find out the newest used block,
+//usually load once time at start up.
+void zsy_LoadFromFlash(void)
+{
+	//set initial address.
+	modbusObj.curAddr=ZSY_DATA_ADDR_BASE;
+	modbusObj.newAddr=ZSY_DATA_ADDR_BASE;
+
+	//search loop.
+	while(modbusObj.curAddr < (ZSY_DATA_ADDR_BASE+PAGE_SIZE))
+	{
+		uint32_t u32RdData = RD_WORD(modbusObj.curAddr);
+		if(u32RdData==0x19870901)
+		{
+			//this block is used,try to check next one.
+			modbusObj.curAddr += 20;
+
+		}else{
+			//find the unused block,it's 0xFFFFFFFF. so,back a block.
+			modbusObj.curAddr-=20;
+
+			//to avoid down-overflow,so here check to afford the beginning search.
+			if(modbusObj.curAddr<ZSY_DATA_ADDR_BASE)
+			{
+				modbusObj.curAddr=ZSY_DATA_ADDR_BASE;
+			}else if(modbusObj.curAddr>(ZSY_DATA_ADDR_BASE+PAGE_SIZE))
+			{
+				modbusObj.curAddr=(ZSY_DATA_ADDR_BASE+PAGE_SIZE);
+			}
+			//read one block data.
+			uint32_t uBlkPrefix=RD_WORD(modbusObj.curAddr+0);
+			if(uBlkPrefix==0x19870901)
+			{
+				modbusObj.m_uOutputVol=RD_WORD(modbusObj.curAddr+4);
+				modbusObj.m_uVideoCtl=RD_WORD(modbusObj.curAddr+8);
+				modbusObj.m_uFPGAReg=RD_WORD(modbusObj.curAddr+12);
+				modbusObj.m_uCrossXY=RD_WORD(modbusObj.curAddr+16);
+			}else{
+				//maybe the first running , no one used block in Flash.
+				//this is the default parameters.
+				modbusObj.m_uOutputVol=100;
+				modbusObj.m_uVideoCtl=1;
+				modbusObj.m_uFPGAReg=1;
+				modbusObj.m_uCrossXY=0;
+			}
+			//output the default value.
+//			uint8_t buffer[128];
+//			sprintf("Log:%d,%d,%d,%d\n",///<
+//					modbusObj.m_uOutputVol,modbusObj.m_uVideoCtl,///<
+//					modbusObj.m_uFPGAReg,modbusObj.m_uCrossXY);
+//			HAL_UART_Transmit(&huart1, buffer, strlen(buffer), 1000);
+			return;
+		}
+	}
+}
 //when the current of DC motor gets to grow
 //this interrupt occurs,stop PWM output.
 void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef *hadc) {
@@ -294,9 +431,9 @@ void zsy_Delay()
 	uint8_t 		i;
 
 	for (i = 0; i < 200; i++)
-		{
+	{
 		;
-		}
+	}
 }
 void zsyParseModBusFrame(ZModBusObject *obj) {
 	if (obj->m_flagEncrypt) {
@@ -561,38 +698,60 @@ void zsyParseModBusFrame(ZModBusObject *obj) {
 		zsy_Delay();
 		HAL_GPIO_WritePin(GPIOD, M62429_CLK_Pin, GPIO_PIN_SET);
 		zsyTxResponse(nReg_OutVolume_W, obj->m_uOutputVol);
+
+		//output volume was changed,we should remember it.
+		zsy_FlushToFlash();
 	}
-		break;
+	break;
 	case nReg_VideoCtl_R:
 		//44 45 43 54 00 00 00 10 00 00 00 00 01 00 00 07 00 00 00 01 2C 23 72 2A
 		zsyTxResponse(nReg_VideoCtl_R, obj->m_uVideoCtl);
 		break;
 	case nReg_VideoCtl_W:
 		//44 45 43 54 00 00 00 10 00 00 00 00 01 80 00 07 00 00 00 02 3d 3c c9 62
+		if(obj->m_data==0x1)
+		{
+			obj->m_uVideoCtl=1;
+		}else if(obj->m_data==0x2)
+		{
+			obj->m_uVideoCtl=2;
+		}else{
+			//other value does not support.
+		}
+		zsyTxResponse(nReg_VideoCtl_W, obj->m_data);
 
-	zsyTxResponse(nReg_OutVolume_W, obj->m_data);
-	break;
+		//video control register was changed,we should remember it.
+		zsy_FlushToFlash();
+		break;
 	case nReg_FPGA_R:
 		//44 45 43 54 00 00 00 10 00 00 00 00 01 00 00 08 00 00 00 01 51 8C 1A 07
-		zsyTxResponse(nReg_OutVolume_W, obj->m_uFPGAReg);
+		zsyTxResponse(nReg_FPGA_R, obj->m_uFPGAReg);
 		break;
 	case nReg_FPGA_W:
-		//44 45 43 54 00 00 00 10 00 00 00 00 01 80 00 08 00 00 00 02 51 8C 1A 07
-		zsyTxResponse(nReg_OutVolume_W, obj->m_data);
+		//44 45 43 54 00 00 00 10 00 00 00 00 01 80 00 08 00 00 00 02 40 93 a1 4f
+		obj->m_uFPGAReg=obj->m_data;
+		zsyTxResponse(nReg_FPGA_W, obj->m_uFPGAReg);
+
+		//FPGA register was changed,we should remember it.
+		zsy_FlushToFlash();
 		break;
 	case nReg_CrossXY_R:
 		//44 45 43 54 00 00 00 10 00 00 00 00 01 00 00 09 01 23 04 56 7F 38 AD 38
-		zsyTxResponse(nReg_OutVolume_W, obj->m_uCrossXY);
+		zsyTxResponse(nReg_CrossXY_R, obj->m_uCrossXY);
 		break;
 	case nReg_CrossXY_W:
 		//44 45 43 54 00 00 00 10 00 00 00 00 01 80 00 09 01 23 04 56 08 D1 B8 36
-		zsyTxResponse(nReg_OutVolume_W, obj->m_data);
+		obj->m_uCrossXY=obj->m_data;
+		zsyTxResponse(nReg_CrossXY_W, obj->m_data);
+
+		//CrossXY register was changed,we should remember it.
+		zsy_FlushToFlash();
 		break;
 	case nReg_AutoFocus1_R:
-		zsyTxResponse(nReg_OutVolume_W, obj->m_data);
+		zsyTxResponse(nReg_AutoFocus1_R, obj->m_data);
 		break;
 	case nReg_AutoFocus1_W:
-		zsyTxResponse(nReg_OutVolume_W, obj->m_data);
+		zsyTxResponse(nReg_AutoFocus1_W, obj->m_data);
 		break;
 	default:
 		break;
@@ -642,6 +801,9 @@ int main(void)
 	MX_TIM5_Init();
 	/* USER CODE BEGIN 2 */
 
+	//zsy:read Flash to restore previous parameters.
+	zsy_LoadFromFlash();
+
 	//zsy:start TIM1-CH1/CH1N to driver DC motor.
 	//zsy:DC motor to get ZeroPoint through Peak Current at startup.
 	HAL_GPIO_WritePin(NSLEEP_GPIO_Port, NSLEEP_Pin, GPIO_PIN_SET);
@@ -682,10 +844,6 @@ int main(void)
 	modbusObj.m_uBatteryPercent = 0;
 	modbusObj.m_uRSSIPercent = 0;
 	modbusObj.m_uDistance = 0;
-	modbusObj.m_uOutputVol = 0;
-	modbusObj.m_uVideoCtl = 0;
-	modbusObj.m_uFPGAReg = 0;
-	modbusObj.m_uCrossXY = 0;
 
 	//if this initial value is 0,it may cause error.
 	//here we do not set to 0,because it reaches the boundary.
@@ -1512,7 +1670,7 @@ void ZModBusTaskLoop(void *argument)
 				uint32_t t2 = g_Uart1DmaPoll[i + 2];
 				uint32_t t3 = g_Uart1DmaPoll[i + 3];
 				uint32_t uRxData = (t0 << 24) | (t1 << 16) | (t2 << 8)
-												| (t3 << 0);
+																		| (t3 << 0);
 				switch (modbusObj.m_fsm) {
 				case UnPack_Sync_Filed:
 					if (uRxData == 0x44454354) {
